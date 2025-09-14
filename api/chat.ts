@@ -42,11 +42,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     res.status(401).json({ error: "Unauthorized" });
     return;
   }
+  console.log('[chat] userId', userId);
 
   const { chatId: incomingChatId, content, model } = parse.data;
 
   // Ensure a chat exists for this user
-  const writer = createServiceRoleClient() ?? supabase;
+  const service = createServiceRoleClient();
+  const writer = service ?? supabase;
+  console.log('[chat] usingServiceRole', !!service);
   let chatId = incomingChatId ?? null;
   if (chatId) {
     const { data: c, error: cErr } = await supabase.from('chats').select('id,user_id').eq('id', chatId).maybeSingle();
@@ -63,6 +66,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
     chatId = chatRow.id as string;
   }
+  console.log('[chat] active chatId', chatId);
 
   // Insert user message
   const { data: userMsg, error: umErr } = await writer
@@ -75,6 +79,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return;
   }
   const userMessageId = userMsg.id as string;
+  console.log('[chat] stored userMessageId', userMessageId);
+
+  // Start analysis immediately (do not wait for assistant)
+  ;(async () => {
+    try {
+      console.log('[chat] analysis start', { userMessageId });
+      const analysis = await analyzeAnger([{ role: 'user', content }]);
+      const { error: upErr } = await writer.from('messages').update({ analysis }).eq('id', userMessageId);
+      if (upErr) console.error('[chat] analysis update failed', upErr);
+      else console.log('[chat] analysis updated', { userMessageId, analysis });
+    } catch (e) {
+      console.error('Analysis failed', e);
+    }
+  })();
 
   // Build context from last N messages in this chat
   const { data: history } = await supabase
@@ -99,16 +117,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     .select('id')
     .single();
   if (amErr) console.error('Failed to store assistant message:', amErr);
+  else console.log('[chat] stored assistantMessageId', asstMsg?.id);
 
-  // Fire-and-forget analysis on the user message only
-  ;(async () => {
-    try {
-      const analysis = await analyzeAnger([{ role: 'user', content }]);
-      await writer.from('messages').update({ analysis }).eq('id', userMessageId);
-    } catch (e) {
-      console.error('Analysis failed', e);
-    }
-  })();
+  // (analysis already kicked off above)
 
   res.status(200).json({
     reply,

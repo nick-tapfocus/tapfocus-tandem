@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { KeyboardAvoidingView, Platform, SafeAreaView, StyleSheet, Text, TextInput, TouchableOpacity, View, FlatList } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { createClient } from '@supabase/supabase-js';
+import { supabase } from '@/lib/supabase';
 import { Colors } from '@/constants/theme';
 import { ThemedView } from '@/components/themed-view';
 import { ThemedText } from '@/components/themed-text';
@@ -23,15 +23,10 @@ export default function ChatScreen() {
   const [chatId, setChatId] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const flatListRef = useRef<FlatList<ChatMessage>>(null);
+  const channelReadyRef = useRef(false);
+  const pendingAnalysisRef = useRef<Record<string, number>>({});
 
-  const supabase = useMemo(() => {
-    const url = process.env.EXPO_PUBLIC_SUPABASE_URL!;
-    const key = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY!;
-    const authOptions = Platform.OS === 'web'
-      ? { autoRefreshToken: true, persistSession: true, detectSessionInUrl: false }
-      : { storage: AsyncStorage as any, autoRefreshToken: true, persistSession: true, detectSessionInUrl: false };
-    return createClient(url, key, { auth: authOptions as any });
-  }, []);
+  // Use singleton supabase client to avoid duplicate auth/storage instances
 
   // On load: pick most recent chat for this user from DB
   useEffect(() => {
@@ -70,56 +65,74 @@ export default function ChatScreen() {
     })();
   }, [chatId, supabase]);
 
-  // Realtime for this chat: assistant inserts and analysis updates
+  // Realtime for this chat: assistant inserts and analysis updates (catch-all, local filter)
   useEffect(() => {
     if (!chatId) return;
+    channelReadyRef.current = false;
     const channel = supabase
       .channel(`messages_${chatId}`)
-      .on(
-        'postgres_changes',
-        { event: 'INSERT', schema: 'public', table: 'messages', filter: `chat_id=eq.${chatId}` },
-        (payload) => {
-          const row = payload.new as any;
-          if (row.role === 'assistant') {
-            setMessages((prev) => {
-              if (prev.some((m) => m.id === row.id)) return prev;
-              return [...prev, { id: row.id, role: 'assistant', content: row.content } as ChatMessage];
-            });
-          }
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'messages' }, (payload) => {
+        const row = payload.new as any;
+        if (!row || row.chat_id !== chatId) return;
+        console.log('[chat] PG change', payload.eventType, row);
+        if (payload.eventType === 'INSERT') {
+          setMessages((prev) => {
+            if (prev.some((m) => m.id === row.id)) return prev;
+            const next = [...prev];
+            if (row.role === 'user') {
+              // Upgrade optimistic user message (temp id) to DB id by content match
+              let idx = -1;
+              for (let i = next.length - 1; i >= 0; i--) {
+                const m = next[i];
+                const isTempId = typeof m.id === 'string' && !m.id.includes('-');
+                if (m.role === 'user' && isTempId && m.content === row.content) { idx = i; break; }
+              }
+              if (idx >= 0) {
+                next[idx] = { ...next[idx], id: row.id } as ChatMessage;
+                // Apply any pending analysis now that we have the real id
+                const pendingAnger = pendingAnalysisRef.current[row.id];
+                if (typeof pendingAnger === 'number') {
+                  next[idx] = { ...next[idx], analysis: { anger: pendingAnger } } as ChatMessage;
+                  delete pendingAnalysisRef.current[row.id];
+                }
+                return next;
+              }
+            }
+            // Append new row (assistant or unmatched user)
+            next.push({ id: row.id, role: row.role, content: row.content } as ChatMessage);
+            return next;
+          });
+          return;
         }
-      )
-      .on(
-        'postgres_changes',
-        { event: 'UPDATE', schema: 'public', table: 'messages', filter: `chat_id=eq.${chatId}` },
-        (payload) => {
-          const updated = payload.new as any;
-          // Debug log
-          console.log('[chat] UPDATE payload', updated);
-          const anger = updated?.analysis?.anger as number | undefined;
-          const updatedId = updated?.id as string | undefined;
+        if (payload.eventType === 'UPDATE') {
+          const anger = row?.analysis?.anger as number | undefined;
+          const updatedId = row?.id as string | undefined;
           if (typeof anger === 'number' && updatedId) {
             setMessages((prev) => {
               const next = [...prev];
               let idx = next.findIndex((m) => m.id === updatedId);
-              // Fallback: match by content if id not yet swapped in UI
-              if (idx < 0 && typeof updated.content === 'string') {
+              if (idx < 0 && typeof row.content === 'string') {
                 for (let i = next.length - 1; i >= 0; i--) {
                   const m = next[i];
-                  if (m.role === 'user' && m.content === updated.content && !m.analysis) {
-                    idx = i;
-                    break;
-                  }
+                  if (m.role === 'user' && m.content === row.content && !m.analysis) { idx = i; break; }
                 }
               }
               if (idx >= 0) next[idx] = { ...next[idx], id: updatedId, analysis: { anger } } as ChatMessage;
+              else pendingAnalysisRef.current[updatedId] = anger;
               return next;
             });
           }
         }
-      )
-      .subscribe();
+      })
+      .subscribe((status: any) => {
+        if (status === 'SUBSCRIBED') {
+          channelReadyRef.current = true;
+          console.log('[chat] Realtime subscribed for chat', chatId);
+        }
+      });
     return () => {
       supabase.removeChannel(channel);
+      channelReadyRef.current = false;
     };
   }, [supabase, chatId]);
 
@@ -152,9 +165,50 @@ export default function ChatScreen() {
           if (idx >= 0) next[idx] = { ...next[idx], id: data.userMessageId };
           return next;
         });
+        // Apply any pending analysis captured before id swap
+        const pendingAnger = pendingAnalysisRef.current[data.userMessageId];
+        if (typeof pendingAnger === 'number') {
+          setMessages((prev) => {
+            const next = [...prev];
+            const i = next.findIndex((m) => m.id === data.userMessageId);
+            if (i >= 0) next[i] = { ...next[i], analysis: { anger: pendingAnger } } as ChatMessage;
+            return next;
+          });
+          delete pendingAnalysisRef.current[data.userMessageId];
+        }
       }
       if (data.chatId && !chatId) {
         setChatId(data.chatId);
+      }
+
+      // Immediately append assistant reply once with server-provided id; Realtime will no-op due to dedupe
+      if (data.assistantMessageId && typeof data.reply === 'string') {
+        setMessages((prev) => {
+          if (prev.some((m) => m.id === data.assistantMessageId)) return prev;
+          return [...prev, { id: data.assistantMessageId, role: 'assistant', content: data.reply } as ChatMessage];
+        });
+      }
+
+      // Backfill in case INSERT/UPDATE happened before SUBSCRIBED
+      const finalChatId: string | null = chatId ?? data.chatId ?? null;
+      if (finalChatId) {
+        try {
+          const { data: recent } = await supabase
+            .from('messages')
+            .select('id, role, content, analysis')
+            .eq('chat_id', finalChatId)
+            .order('created_at', { ascending: true })
+            .limit(10);
+          if (recent && Array.isArray(recent)) {
+            setMessages((prev) => {
+              const ids = new Set(prev.map((m) => m.id));
+              const toAdd = recent
+                .filter((m: any) => !ids.has(m.id))
+                .map((m: any) => ({ id: m.id, role: m.role, content: m.content, analysis: m.analysis ?? null } as ChatMessage));
+              return toAdd.length ? [...prev, ...toAdd] : prev;
+            });
+          }
+        } catch {}
       }
     } catch (e) {
       const err: ChatMessage = {
