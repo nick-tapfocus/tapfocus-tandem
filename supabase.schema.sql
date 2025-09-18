@@ -114,6 +114,33 @@ create policy "insert own profile" on public.profiles
 
 -- legacy policies removed
 
+-- Auto-create a profile row for every new auth user
+create or replace function public.handle_new_auth_user()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  insert into public.profiles(user_id)
+  values (new.id)
+  on conflict (user_id) do nothing;
+  return new;
+end;
+$$;
+
+drop trigger if exists on_auth_user_created on auth.users;
+create trigger on_auth_user_created
+after insert on auth.users
+for each row execute function public.handle_new_auth_user();
+
+-- Backfill any missing profiles for existing users (idempotent)
+insert into public.profiles(user_id)
+select u.id from auth.users u
+left join public.profiles p on p.user_id = u.id
+where p.user_id is null
+on conflict (user_id) do nothing;
+
 -- New chat model: chats and messages (normalized)
 
 create table if not exists public.chats (
